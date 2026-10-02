@@ -14,7 +14,7 @@ class FakeModel:
     def __init__(self, name, device, compute_type):
         self.name = name
 
-    def transcribe(self, audio, beam_size, language, vad_filter):
+    def transcribe(self, audio, beam_size, language, vad_filter, **kw):
         return iter([FakeSeg(" hello "), FakeSeg("world")]), None
 
 
@@ -139,3 +139,24 @@ async def test_atranscribe_scored_and_detailed_agree(monkeypatch):
     r = await t.atranscribe_scored(np.zeros(16000, dtype=np.int16))
     assert (r.text, r.language) == ("yes", "en")
     assert t.transcribe_detailed(np.zeros(16000, dtype=np.int16)) == ("yes", "en")
+
+
+def test_decoding_is_bounded_so_noise_cannot_stall_a_turn():
+    """Whisper's default temperature fallback re-ran a hallucination loop on
+    3 s of pink noise for 297 s — long enough to stall a confirm and the task
+    behind it. Every transcription is bounded: one retry and a token cap."""
+    from veronica.speech import stt
+
+    seen = {}
+
+    class Model:
+        def transcribe(self, audio, **kw):
+            seen.update(kw)
+            return iter([]), None
+
+    t = stt.Transcriber.__new__(stt.Transcriber)
+    t._model, t.language = Model(), "en"
+    t.transcribe_scored(np.zeros(16000, dtype=np.int16))
+    assert seen["temperature"] == stt.DECODE_TEMPERATURES and len(stt.DECODE_TEMPERATURES) <= 2
+    assert seen["max_new_tokens"] == stt.MAX_NEW_TOKENS
+    assert seen["condition_on_previous_text"] is False

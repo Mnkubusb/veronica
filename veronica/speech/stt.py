@@ -1,8 +1,13 @@
 import asyncio
 from typing import NamedTuple
 
+
 import numpy as np
 from faster_whisper import WhisperModel
+
+# See transcribe_scored: bounded so noise can't hold up a turn for minutes.
+DECODE_TEMPERATURES = (0.0, 0.4)
+MAX_NEW_TOKENS = 160
 
 
 def stt_spec(settings, mode: str) -> tuple[str, str | None, str]:
@@ -68,7 +73,15 @@ class Transcriber:
     def transcribe_scored(self, pcm16: np.ndarray) -> Transcript:
         audio = pcm16.astype(np.float32) / 32768.0
         segments, info = self._model.transcribe(
-            audio, beam_size=1, language=self.language, vad_filter=False
+            audio, beam_size=1, language=self.language, vad_filter=False,
+            # Bounded decoding. On noise, whisper's default temperature
+            # fallback (0.0→1.0 in six steps) retries a hallucination loop
+            # again and again: a 3 s pink-noise clip took 297 s, long enough
+            # to stall a confirm and the task waiting on it. Spoken turns are
+            # short, so one retry and a token cap lose nothing real.
+            temperature=DECODE_TEMPERATURES,
+            max_new_tokens=MAX_NEW_TOKENS,
+            condition_on_previous_text=False,
         )
         return _scored(segments, info, self.language)
 
