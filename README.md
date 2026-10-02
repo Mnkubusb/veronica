@@ -25,6 +25,9 @@ Do not set `ANTHROPIC_API_KEY` (or any other vendor key) — every brain uses th
 - Interrupt with "hold on" / "wait" / "one sec" ("ruko", "ek minute") and she stops but keeps the rest of the
   answer: say "continue" / "carry on" / "go on" ("aage bolo") and she picks up at the next sentence. Anything
   else you say is treated as a new request and the remainder is dropped; "stop" / "that's all" still cancels.
+  If the interruption cut her off mid-task (browsing, screen control, a long explanation), "continue" then asks the
+  same brain to carry on from where it stopped; every risky step in it asks again. A brain switch or 10 minutes
+  without a "continue" drops the task.
 - If a slow answer leaves her silent for more than 3.5 s she says "On it." once (Settings → Listening, or
   `VERONICA_ACK_AFTER_S`; 0 turns it off).
 - Risky actions (writing files, shell commands that change things, AppleScript, clipboard writes) ask "Run …?" — answer "yes" or "no".

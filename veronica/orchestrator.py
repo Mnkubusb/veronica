@@ -110,6 +110,20 @@ class ConfirmResult:
         return self.outcome == "approved"
 
 
+@dataclass(frozen=True)
+class InterruptedTask:
+    """A brain turn a barge cut short while the brain was still working
+    (its stream had not ended), kept so "continue" can ask the same brain to
+    carry on with it. Facts only — never an approval: the carry-on turn is
+    a new turn, and the gate treats every call in it as new."""
+    request: str               # what the user originally asked for
+    backend: str | None        # the brain it was on; only that one has the session
+    lang: str | None
+    said: list[str]            # sentences she produced (the parked tail included)
+    steps: list[dict]          # the F3 plan steps ({summary, state}) at the barge
+    at: float                  # Orchestrator._clock() when it was cut
+
+
 class Orchestrator:
     # No bare "ha": whisper writes laughter as "ha ha", which must never
     # approve a tool. Devanagari forms are for pinned Hindi mode, where
@@ -459,6 +473,12 @@ class Orchestrator:
         # says anything other than a pause/continue phrase, and a new brain
         # turn drops them too, so they can never leak into a later answer.
         self._paused_tail: list[tuple[str, asyncio.Future]] | None = None
+        # ...and the task behind them, when the barge also cut the BRAIN off
+        # mid-stream: the tail is at most a couple of sentences, the rest of
+        # a multi-step task was never produced. "Continue" speaks the tail,
+        # then asks the same brain to carry on (_continue_turn). Dropped with
+        # the tail, on a brain switch, and after CARRY_ON_MAX_AGE_S.
+        self._interrupted_task: InterruptedTask | None = None
         self._now_speaking = ""
         # Brain turns are numbered per handle_text call; the brain gets the
         # id (begin_turn) so a pre-approval can be pinned to one turn.
@@ -790,9 +810,13 @@ class Orchestrator:
                 # device hiccup abort listening or a reply.
                 log.warning("chime failed", exc_info=True)
 
-    async def handle_text(self, text: str, images: list[bytes] = (), *, lang: str | None = None) -> list[str]:
+    async def handle_text(self, text: str, images: list[bytes] = (), *, lang: str | None = None,
+                          carry: InterruptedTask | None = None) -> list[str]:
         """Ask the brain and speak each sentence; synth N+1 overlaps playback of N.
-        `lang` ("hi"/"en"/None) picks the voice the reply is spoken with."""
+        `lang` ("hi"/"en"/None) picks the voice the reply is spoken with.
+        `carry` is set when `text` is a carry-on prompt (_continue_turn): the
+        task it carries on is what this turn is "about" — for memory, and
+        for the record a second barge leaves behind."""
         self._set("thinking")
         self._barged = False   # fresh turn: any earlier barge no longer applies
         # A new answer supersedes whatever an earlier pause was holding, even
@@ -803,6 +827,10 @@ class Orchestrator:
         getattr(self.brain, "begin_turn", lambda _tid: None)(self._turn_id)
         t0 = time.monotonic()
         spoken: list[str] = []
+        # Whether the brain's own stream ran to its end. A barge after that
+        # only cut playback (the parked tail is all there is); a barge before
+        # it cut the brain off mid-task, which "continue" has to pick up.
+        brain_done = False
         first = True
         # The item taken off the queue but not yet handed to the player: a
         # pause landing while its synth is still running must keep it, while
@@ -812,6 +840,7 @@ class Orchestrator:
         queue: asyncio.Queue = asyncio.Queue(maxsize=2)
 
         async def producer():
+            nonlocal brain_done
             try:
                 # Only pass `images=` when there actually are any, so test
                 # doubles for Brain.ask(text) that don't accept the kwarg
@@ -834,6 +863,7 @@ class Orchestrator:
                         # otherwise run to completion orphaned.
                         fut.cancel()
                         raise
+                brain_done = True
             finally:
                 await queue.put(None)
 
@@ -953,6 +983,18 @@ class Orchestrator:
             if tail:
                 self._paused_tail = tail
                 log.info("barge parked %d unspoken sentence(s)", len(tail))
+            if self._barged and not brain_done:
+                # Taken before _plan_finish below, which would call the step
+                # in flight "done" — it may not have been.
+                self._interrupted_task = InterruptedTask(
+                    request=carry.request if carry else text,
+                    backend=getattr(self.brain, "name", None),
+                    lang=lang,
+                    said=(list(carry.said) if carry else []) + spoken,
+                    steps=(list(carry.steps) if carry else []) + [dict(s) for s in self._plan],
+                    at=self._clock(),
+                )
+                log.info("barge cut the brain off mid-task: %r", self._interrupted_task.request)
             if ack is not None:
                 with contextlib.suppress(BaseException):
                     await ack
@@ -967,7 +1009,9 @@ class Orchestrator:
                 await self.say("I have nothing to say to that.")
         elif self.store is not None and self.s.memory_enabled:
             reply = " ".join(spoken)
-            self.store.add_turn(text, reply)
+            # A carry-on turn is remembered against what the user asked, not
+            # the prompt she built to pick it back up.
+            self.store.add_turn(carry.request if carry else text, reply)
             # The brain never says which facts it leaned on, so infer it from
             # the words that came out (MemoryStore.touch_facts_used) and let
             # that order the facts block. Done here, after the last sentence
@@ -1004,9 +1048,13 @@ class Orchestrator:
 
     def _drop_paused_tail(self, why: str) -> None:
         """Throw away the sentences a pause parked, cancelling the synth
-        futures nobody will await now. Anything but "continue" gets here:
-        the user has moved on, and a stale remainder spoken into a later
-        turn would be worse than saying nothing."""
+        futures nobody will await now, and the interrupted task behind them.
+        Anything but "continue" gets here: the user has moved on, and a stale
+        remainder spoken into a later turn — or a half-done task picked back
+        up by surprise — would be worse than saying nothing."""
+        if self._interrupted_task is not None:
+            log.info("dropping the interrupted task %r: %s", self._interrupted_task.request, why)
+            self._interrupted_task = None
         tail, self._paused_tail = self._paused_tail, None
         if not tail:
             return
@@ -1068,7 +1116,82 @@ class Orchestrator:
                 for _sent, fut in rest:
                     _cancel_or_reap(fut)
 
-    async def _brain_turn(self, text: str, images: list[bytes] = (), *, lang: str | None = None) -> list[str]:
+    # Long enough for "hold on" while the user deals with a phone call; short
+    # enough that "continue" an hour later can't restart a forgotten task.
+    CARRY_ON_MAX_AGE_S = 600.0
+    CARRY_ON_TEXT = {"en": "Carrying on.", "hi": "आगे बढ़ती हूँ।"}
+    # Only the end of what she said: enough for the brain to find its place,
+    # short enough that the prompt stays a nudge, not a transcript. The
+    # session holds the rest.
+    _CARRY_SAID_MAX = 300
+    _CARRY_STEPS_MAX = 8
+    _CARRY_STEP_NOTE = {"running": " (may not have finished)", "failed": " (failed)",
+                        "declined": " (declined)"}
+
+    def _resumable_task(self) -> InterruptedTask | None:
+        """The interrupted task "continue" may carry on, or None. One that
+        has gone stale, or belongs to a brain that is no longer up (a
+        failover since — the new one has none of that session), is dropped
+        here rather than resumed by surprise."""
+        task = self._interrupted_task
+        if task is None:
+            return None
+        if self._clock() - task.at > self.CARRY_ON_MAX_AGE_S:
+            why = "too old"
+        elif getattr(self.brain, "name", None) != task.backend:
+            why = "a different brain is up"
+        else:
+            return task
+        log.info("dropping the interrupted task %r: %s", task.request, why)
+        self._interrupted_task = None
+        return None
+
+    def _carry_on_prompt(self, task: InterruptedTask) -> str:
+        """The message that picks an interrupted task back up. Plain facts:
+        the brain's own session has the detail; this just says where she
+        stopped, so it doesn't start over or redo a step."""
+        parts = [f"Carry on with what you were doing before I interrupted: {task.request.strip()}."]
+        said = " ".join(task.said).strip()
+        if said:
+            if len(said) > self._CARRY_SAID_MAX:
+                said = "…" + said[-self._CARRY_SAID_MAX:].lstrip()
+            parts.append(f'You had already said: "{said}"')
+        # A step still waiting on its yes/no ("pending") was never done: the
+        # carry-on turn asks for it again, so it isn't listed as done.
+        steps = [s["summary"] + self._CARRY_STEP_NOTE.get(s["state"], "")
+                 for s in task.steps if s["state"] != "pending"][-self._CARRY_STEPS_MAX:]
+        if steps:
+            parts.append(f"Steps already done: {'; '.join(steps)}.")
+        parts.append("Don't repeat those; continue from where you stopped.")
+        return " ".join(parts)
+
+    async def _continue_turn(self, tail: list[tuple[str, asyncio.Future]] | None) -> None:
+        """"Continue": speak what the pause parked, then — only if the barge
+        cut the brain off mid-task — run a carry-on turn on the same brain.
+        Run under the barge race, so either half can be paused again. The
+        task is taken only as its turn starts: a barge during the tail
+        leaves it in place for the next "continue"."""
+        if tail:
+            await self._resume_tail(tail)
+        task = self._resumable_task()
+        if task is None or self.muted:
+            return
+        if not tail:
+            # Nothing to finish saying first: say something, or the silence
+            # while the brain spins back up reads as "she didn't hear me".
+            hindi = (task.lang or self._utterance_lang) == "hi"
+            self.player.reset()
+            await self.say(self.CARRY_ON_TEXT["hi" if hindi else "en"], lang="hi" if hindi else None)
+        self._interrupted_task = None
+        log.info("carrying on with %r (%d step(s) done)", task.request, len(task.steps))
+        # A brand-new turn as far as the gate is concerned: handle_text gives
+        # it a new turn id, so a pre-approval worded into the original request
+        # (pinned to that turn's id) can't apply here, and the barge already
+        # dropped screen trust. Every confirm-class call asks again.
+        await self._brain_turn(self._carry_on_prompt(task), lang=task.lang, carry=task)
+
+    async def _brain_turn(self, text: str, images: list[bytes] = (), *, lang: str | None = None,
+                          carry: InterruptedTask | None = None) -> list[str]:
         """handle_text plus the confirm redirect: if a confirmation in this
         turn was answered with something other than yes/no, the brain got
         it in the deny message and has usually re-planned in its reply
@@ -1079,13 +1202,17 @@ class Orchestrator:
         the switcher moves to the next ready brain (and says so) and the
         same request is re-run there once per hop, at most one hop per
         backend so a chain of limits can't loop. The redirect re-run goes
-        through the same path — a limit there is a limit like any other."""
+        through the same path — a limit there is a limit like any other.
+
+        `carry` (a carry-on turn) skips the quiet return to the preferred
+        brain: the task's session is on the one that's up."""
         if self.switcher is not None:
-            await self.switcher.maybe_return()
+            if carry is None:
+                await self.switcher.maybe_return()
             # ...and, the other way round, drop to the local model when the
             # brain that's up needs a vendor host and the wire is dead.
             await self.switcher.maybe_offline()
-        spoken = await self._ask_with_failover(text, images, lang=lang)
+        spoken = await self._ask_with_failover(text, images, lang=lang, carry=carry)
         if spoken is None:
             return []
         heard = getattr(self.brain, "pending_redirect", None)
@@ -1102,12 +1229,15 @@ class Orchestrator:
         return spoken
 
     async def _ask_with_failover(self, text: str, images: list[bytes] = (), *,
-                                 lang: str | None = None) -> list[str] | None:
+                                 lang: str | None = None,
+                                 carry: InterruptedTask | None = None) -> list[str] | None:
         """handle_text, retried on the next ready brain each time one reports
         its usage limit. None = nothing left to say (no brain is ready)."""
+        # `carry` only when set: stand-in handle_texts in tests predate it.
+        extra = {"carry": carry} if carry is not None else {}
         for _hop in range(len(BACKENDS)):
             try:
-                return await self.handle_text(text, images, lang=lang)
+                return await self.handle_text(text, images, lang=lang, **extra)
             except LimitError as e:
                 if self.switcher is None:
                     await self.say(f"{self._brain_label()} hit its usage limit.")
@@ -1197,6 +1327,8 @@ class Orchestrator:
         if sw.brain.name == name and not sw.standing_in:
             await self.say(f"Already on {BACKENDS[name].label}.")
             return
+        # A task the old brain was cut off in can't be carried on by another.
+        self._drop_paused_tail("the brain was switched")
         await self.brain.interrupt()
         getattr(self.brain, "clear_trust", lambda: None)()
         avail = await sw.switch(name)
@@ -2242,14 +2374,15 @@ class Orchestrator:
             # "wait" is still a request for the brain, and the ladder below
             # keeps deciding those.
             resume_hit = False
-            if self._paused_tail is not None:
+            if self._paused_tail is not None or self._resumable_task() is not None:
                 if is_pause_phrase(text):
                     # The barge already stopped playback and parked the rest,
                     # so there is nothing to do but stay quiet and listen for
                     # the word that starts her again. The post-wake window is
                     # used rather than the short follow-up one: the user
                     # interrupted on purpose and may need a moment.
-                    log.info("paused with %d sentence(s) held", len(self._paused_tail))
+                    log.info("paused with %d sentence(s) held%s", len(self._paused_tail or ()),
+                             " and a task cut short" if self._interrupted_task else "")
                     self._set("paused")
                     pcm = await self._capture_or_ptt(max_s=self.s.listen_wait_s, partial=True)
                     self._end_partial_window()
@@ -2355,10 +2488,11 @@ class Orchestrator:
             )
             if resume_hit:
                 # "Continue": speak the parked remainder (already synthesised)
-                # under the usual barge race, so she can be stopped — or
-                # paused again — part way through it.
+                # and carry on with the task if the brain was cut off, under
+                # the usual barge race, so she can be stopped — or paused
+                # again — part way through either.
                 tail, self._paused_tail = self._paused_tail, None
-                barged = await self._run_with_barge(self._resume_tail(tail))
+                barged = await self._run_with_barge(self._continue_turn(tail))
                 if barged:
                     pcm = await self._relisten(barged)
                     is_followup = False
