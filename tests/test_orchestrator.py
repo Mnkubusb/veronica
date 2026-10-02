@@ -4979,6 +4979,215 @@ async def test_resume_skips_a_parked_synth_that_came_back_cancelled():
     assert o._paused_tail is None
 
 
+# -- carrying on with an interrupted task ---------------------------------------
+
+class TaskBrain:
+    """A multi-step task: the first ask says "One." (and, with `two`, "Two."
+    straight after), then keeps working — the barge lands while the brain's
+    own stream is still running. Every later ask is the carry-on turn."""
+    name = "claude"
+
+    def __init__(self, two=False):
+        self.asked = []; self.interrupts = 0; self.two = two
+
+    async def ask(self, text):
+        self.asked.append(text)
+        if len(self.asked) == 1:
+            yield "One."
+            if self.two:
+                yield "Two."
+            await asyncio.sleep(10)
+            yield "Never."
+        else:
+            yield "Rest."
+
+    async def interrupt(self): self.interrupts += 1
+
+
+def build_task(stt_texts, captures, two=False):
+    o, states = build_pause(stt_texts, captures=captures)
+    o.brain = TaskBrain(two=two)
+    return o, states
+
+
+async def test_continue_after_an_interrupted_task_carries_on_with_it():
+    o, _ = build_task(["do the thing", "hold on", "continue"], captures=3, two=True)
+    await o.one_turn()
+    # the parked "Two." first, then the brain picks the task back up
+    assert o.player.heard == ["One.", "Two.", "Rest."]
+    assert len(o.brain.asked) == 2
+    resumed = o.brain.asked[1]
+    assert "Carry on with what you were doing" in resumed
+    assert "do the thing" in resumed
+    assert "One. Two." in resumed
+    assert o._interrupted_task is None
+
+
+async def test_continue_with_nothing_parked_says_carrying_on():
+    # the barge cut "One." mid-play with nothing queued behind it
+    o, _ = build_task(["do the thing", "continue"], captures=2)
+    await o.one_turn()
+    assert o.player.heard == ["One.", "Carrying on.", "Rest."]
+    assert "do the thing" in o.brain.asked[1]
+
+
+async def test_a_finished_brain_turn_is_not_carried_on():
+    """The brain had already sent its whole answer; only playback was cut, so
+    "continue" is the parked tail and nothing more."""
+    o, _ = build_pause(["do the thing", "hold on"], captures=2)
+    await o.one_turn()
+    assert o._paused_tail is not None and o._interrupted_task is None
+
+
+async def test_something_else_after_an_interrupt_drops_the_task():
+    o, _ = build_task(["do the thing", "hold on", "what's the weather"], captures=3)
+    await o.one_turn()
+    assert o.brain.asked == ["do the thing", "what's the weather"]
+    assert o._interrupted_task is None
+
+
+async def test_stop_drops_the_interrupted_task():
+    o, states = build_task(["do the thing", "stop"], captures=2)
+    await o.one_turn()
+    assert o._interrupted_task is None
+    assert o.brain.asked == ["do the thing"]
+    assert states[-1] == "idle"
+
+
+async def test_the_task_survives_the_pause_window_closing():
+    o, _ = build_task(["do the thing", "hold on"], captures=2)
+    await o.one_turn()
+    assert o._interrupted_task is not None
+    o.recorder = Rec([np.zeros(1, np.int16)])
+    o.stt = STT(["continue"])
+    await o.one_turn()
+    assert "do the thing" in o.brain.asked[1] and o.brain.asked[1] != "continue"
+
+
+async def test_a_stale_interrupted_task_is_not_carried_on():
+    now = [1000.0]
+    o, _ = build_task(["do the thing", "hold on"], captures=2)
+    o._clock = lambda: now[0]
+    await o.one_turn()
+    assert o._interrupted_task is not None
+    now[0] += Orchestrator.CARRY_ON_MAX_AGE_S + 1
+    o.recorder = Rec([np.zeros(1, np.int16)])
+    o.stt = STT(["continue"])
+    await o.one_turn()
+    # just a request now — the old task is gone
+    assert o.brain.asked == ["do the thing", "continue"]
+    assert o._interrupted_task is None
+
+
+async def test_a_brain_switch_drops_the_interrupted_task():
+    o, _ = build_task(["do the thing", "hold on"], captures=2)
+    await o.one_turn()
+    assert o._interrupted_task is not None
+    o.switcher = FakeSwitcher(o.brain)
+    await o._brain_switch_turn(("switch", "codex"))
+    assert o._interrupted_task is None
+
+
+async def test_a_task_from_another_brain_is_not_carried_on():
+    """A failover between the interrupt and "continue" put a different brain
+    up: it has none of the session, so there is nothing to carry on."""
+    o, _ = build_task(["do the thing", "hold on"], captures=2)
+    await o.one_turn()
+    o.brain.name = "codex"
+    o.recorder = Rec([np.zeros(1, np.int16)])
+    o.stt = STT(["continue"])
+    await o.one_turn()
+    assert o.brain.asked == ["do the thing", "continue"]
+
+
+async def test_the_carry_on_prompt_lists_the_steps_already_done():
+    o, _ = build_task(["do the thing", "hold on"], captures=2)
+    calls = []
+
+    async def ask(text):   # two Reads, then still working
+        calls.append(text)
+        if len(calls) == 1:
+            o.tool_card("Read: /a", "auto")
+            o.tool_card("Read: /b", "auto")
+            yield "One."
+            await asyncio.sleep(10)
+        else:
+            yield "Rest."
+
+    o.brain.ask = ask
+    await o.one_turn()
+    prompt = o._carry_on_prompt(o._interrupted_task)
+    assert "Steps already done: Read: /a; Read: /b (may not have finished)." in prompt
+    assert prompt.endswith("Don't repeat those; continue from where you stopped.")
+
+
+async def test_a_second_interrupt_keeps_the_original_request():
+    o, _ = build_task(["do the thing"], captures=1)
+    await o.one_turn()
+    task = o._interrupted_task
+    assert task.request == "do the thing"
+    # the carry-on turn itself gets cut short before it is done
+    o.brain = TaskBrain()
+    o.brain.asked = ["(first)"]
+
+    async def slow_ask(text):
+        o.brain.asked.append(text)
+        yield "Rest."
+        await asyncio.sleep(10)
+
+    o.brain.ask = slow_ask
+    o._interrupted_task = None
+    turn = asyncio.ensure_future(o._brain_turn(o._carry_on_prompt(task), carry=task))
+    await asyncio.sleep(0.02)
+    o._barged = True
+    turn.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await turn
+    again = o._interrupted_task
+    assert again.request == "do the thing"
+    assert again.said == ["One.", "Rest."]
+
+
+class ConfirmTaskBrain:
+    """Same shape as TaskBrain, through the real ToolGate: the carry-on turn
+    makes one confirm-class call."""
+    name = "claude"
+
+    def __init__(self, orch):
+        from veronica.brain.gate import ToolGate
+        self.gate = ToolGate(orch.s, orch.confirm, on_tool=orch.tool_card)
+        self.asked, self.decisions, self.interrupts = [], [], 0
+
+    def begin_turn(self, tid): self.gate.begin_turn(tid)
+    def preapprove(self, tid, until): self.gate.preapprove(tid, until)
+
+    async def ask(self, text):
+        self.asked.append(text)
+        if len(self.asked) == 1:
+            yield "Starting."
+            await asyncio.sleep(10)
+        else:
+            self.decisions.append(await self.gate.decide("Bash", {"command": "rm x"}))
+            yield "Done."
+
+    async def interrupt(self): self.interrupts += 1
+
+
+async def test_a_preapproval_never_carries_over_to_the_resumed_turn():
+    request = "delete x without asking"
+    assert Orchestrator.detect_preapproval(request)
+    o, _ = build_task([request, "continue", "no"], captures=3)
+    events = []
+    o._on_event = lambda k, p: events.append((k, p))
+    o.brain = ConfirmTaskBrain(o)
+    await o.one_turn()
+    assert "Carry on with what you were doing" in o.brain.asked[1]
+    # the carry-on turn asked, and the "no" stood
+    assert [d.kind for d in o.brain.decisions] == ["denied"]
+    asks = [p for k, p in events if k == "tool" and p.get("decision") == "ask"]
+    assert len(asks) == 1
+
+
 # -- the acknowledgement -------------------------------------------------------
 
 class SlowFirstBrain:
