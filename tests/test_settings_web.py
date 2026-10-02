@@ -31,7 +31,8 @@ def fixture_state(**over) -> dict:
         "listening": {"followup_window_s": 6, "confirm_listen_s": 8, "vad_silence_ms": 1200,
                       "max_utterance_s": 20, "wake_min_rms": 0.01, "wake_window_s": 1.5, "wake_hop_s": 0.25,
                       "wake_phrases": ["veronica", "hey veronica"], "input_volume_floor": 85,
-                      "noise_suppression": True, "vad_min_rms": 0.001, "speaker_verification": True,
+                      "noise_suppression": True, "vad_min_rms": 0.001, "noise_transcript_filter": True,
+                      "speaker_verification": True,
                       "speaker_threshold": 0.35, "speaker_verification_wake": False,
                       "voice_profile": {"enrolled": False, "created": "", "active": False, "recent": []}},
         "briefings": {"briefing_enabled": False, "briefing_time": "08:00", "nudges_enabled": True, "nudge_minutes": 5},
@@ -447,6 +448,7 @@ def test_only_my_voice_section_learns_forgets_and_shows_scores():
         browser, page = open_page(p)
         page.evaluate("window.settings.select('listening')")
         assert page.is_checked("#pane input[data-key=noise_suppression]")
+        assert page.is_checked("#pane input[data-key=noise_transcript_filter]")
         assert page.input_value("#pane input[data-key=speaker_threshold]") == "0.35"
         box = page.locator("#pane .voice-profile")
         assert box.get_attribute("data-enrolled") == "0"

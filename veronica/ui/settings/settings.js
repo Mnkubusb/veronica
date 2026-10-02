@@ -316,6 +316,7 @@
       frag.push(settingRow('listening', 'input_volume_floor'));
       frag.push(settingRow('listening', 'noise_suppression'));
       frag.push(settingRow('listening', 'vad_min_rms'));
+      frag.push(settingRow('listening', 'noise_transcript_filter'));
       frag.push(el('h3', {text: 'Only my voice'}));
       frag.push(voiceProfile(section('listening').voice_profile || {}));
       for (const k of ['speaker_verification', 'speaker_threshold', 'speaker_verification_wake']) frag.push(settingRow('listening', k));

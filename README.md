@@ -513,6 +513,13 @@ fires mid-conversation or while muted waits, like a timer), and the schedule per
   "Speech level floor" (`vad_min_rms`, default 0.001, only while suppression runs) keeps faint background talk
   out while you from across the room still get in. Whisper itself still transcribes the unprocessed audio — measured, it understands noisy
   speech better than cleaned-up speech — and the wake word check is untouched.
+- **Noise that sounds like words** — on by default ("Ignore noise that sounds like words",
+  `noise_transcript_filter`). Noise that still reaches whisper comes back as words ("Ich küsse, küsse, küsse.");
+  when whisper's own scores say it wasn't speech, she treats it as silence: it never answers a yes/no (she
+  listens once more, then skips the step), never stops a running task, and never starts a request. A yes/no
+  answer that isn't a yes or a no only redirects the task when it reads like an instruction ("no, open it in
+  Safari instead"); a lone word or another language gets "Sorry, yes or no?" once. Each rejection is logged
+  with its scores (`stt: treated as noise (...)`); `scripts/eval_noise_transcripts.py` measures the thresholds.
 - **Only my voice** — say "Veronica, learn my voice" ("meri awaaz yaad rakho"), or press **Learn my voice** in
   Settings → Listening. She reads three short lines; repeat each after the beep. From then on a request,
   follow-up, dictated line or yes/no answer in someone else's voice (the TV, a person in the room) is ignored as

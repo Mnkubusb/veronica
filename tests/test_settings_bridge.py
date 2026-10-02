@@ -1072,8 +1072,8 @@ class VoiceOrch(FakeOrch):
 def test_listening_state_carries_the_voice_settings_and_profile():
     h = Harness(orch=VoiceOrch())
     st = h.bridge.get_state()["listening"]
-    assert {"noise_suppression", "vad_min_rms", "speaker_verification", "speaker_threshold",
-            "speaker_verification_wake"} <= set(st)
+    assert {"noise_suppression", "vad_min_rms", "noise_transcript_filter", "speaker_verification",
+            "speaker_threshold", "speaker_verification_wake"} <= set(st)
     assert st["voice_profile"]["enrolled"] is True
     assert st["voice_profile"]["recent"][0]["score"] == 0.7
 
@@ -1134,3 +1134,5 @@ def test_speaker_threshold_applies_live():
     assert ("speaker_threshold", 0.5) in h.prefs.overrides
     h.bridge.set("listening", "noise_suppression", False)
     assert h.orch.s.noise_suppression is False
+    h.bridge.set("listening", "noise_transcript_filter", False)
+    assert h.orch.s.noise_transcript_filter is False
