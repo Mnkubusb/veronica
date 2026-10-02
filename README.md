@@ -73,7 +73,7 @@ as anything else that runs without asking. Seven tools are eligible, and **only*
 | `mcp__memory__fact_add` | Remember a fact |
 | `mcp__memory__fact_delete` | Forget a fact |
 | `mcp__browser__browser_click` | Click in the browser |
-| `mcp__browser__browser_type` | Type in the browser (including a typed Enter) |
+| `mcp__browser__browser_type` | Type in the browser — typing only; pressing Enter after it (submitting the form) always asks |
 
 **Destructive tools can never be added**, whichever way you try. Sending mail or messages, AppleScript, every
 screen-control action (`mcp__computer__*`), running a Shortcut and the shell are not on the list, so saying

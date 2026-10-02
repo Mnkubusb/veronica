@@ -374,3 +374,18 @@ def test_auto_allow_entries_are_trimmed_and_blanks_ignored():
 def test_clipboard_write_is_auto_allowed_by_default():
     assert Settings().auto_allow_tools == ["mcp__mac__clipboard_write"]
     assert classify("mcp__mac__clipboard_write", {"text": "hi"}, (), Settings().auto_allow_tools) == ALLOW
+
+
+def test_browser_typing_is_auto_allowable_but_pressing_enter_always_asks():
+    """Ticking "type in the browser" makes plain typing silent; pressing Enter
+    after it submits a form, so that call asks every time — even with the
+    tool on the auto-allow list."""
+    from veronica.brain.policy import always_confirm, classify
+
+    allow = ["mcp__browser__browser_type"]
+    plain = {"target": "Search", "text": "netflix"}
+    submit = {"target": "Search", "text": "netflix", "submit": True}
+    assert classify("mcp__browser__browser_type", plain, auto_allow=allow) == "allow"
+    assert always_confirm("mcp__browser__browser_type", submit)
+    assert classify("mcp__browser__browser_type", submit, auto_allow=allow) == "confirm"
+    assert not always_confirm("mcp__browser__browser_type", plain)

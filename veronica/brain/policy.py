@@ -405,7 +405,8 @@ def _split_chain(command: str) -> list[str]:
 def always_confirm(tool_name: str, tool_input: dict, front: Front | None = None) -> bool:
     """True for calls that get their own yes/no no matter what: sending
     mail/messages, destructive or power/privilege shell commands, an
-    AppleScript that does the same, and screen actions that press Enter,
+    AppleScript that does the same, browser typing that presses Enter,
+    and screen actions that press Enter,
     type into a terminal, or touch a system dialog. `front` is the
     frontmost app for computer tools (None: unknown, only the input is
     judged)."""
@@ -419,6 +420,11 @@ def always_confirm(tool_name: str, tool_input: dict, front: Front | None = None)
         return True
     if server == "mac" and short == "applescript":
         return _mentions(str(tool_input.get("script", "")), _APPLESCRIPT_PHRASES)
+    if server == "browser" and short == "browser_type":
+        # Typing into a page can be auto-allowed; pressing Enter after it
+        # submits whatever form it is in — a search, but also a post, a
+        # purchase or a "type DELETE to confirm" box — so that one asks.
+        return bool(tool_input.get("submit"))
     if server == "computer":
         if front is not None and is_system_dialog(front):
             return True
