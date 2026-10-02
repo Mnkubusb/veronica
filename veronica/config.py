@@ -62,6 +62,13 @@ class Settings(BaseSettings):
     speaker_verification: bool = True
     speaker_verification_wake: bool = False
     speaker_threshold: float = 0.35
+    # Noise that still reaches whisper comes back as words ("Ich küsse,
+    # küsse, küsse."). A transcript whisper itself scores as non-speech
+    # (stt.noise_reason) is silence: never a confirm answer, a request or a
+    # follow-up; and an "other" confirm answer only redirects the task when
+    # it reads like an instruction. Thresholds and the numbers behind them:
+    # scripts/eval_noise_transcripts.py.
+    noise_transcript_filter: bool = True
     # How long a turn may stay silent before she says a short "On it." so a
     # slow brain doesn't feel like a dropped question. 0 turns the line off.
     ack_after_s: float = 8.0   # only for an unusually long wait; see Orchestrator.ACK_MIN_GAP_S
@@ -270,6 +277,11 @@ EDITABLE_SETTINGS: dict[str, EditableField] = {
         "reduction is on. Raise if room noise keeps her listening; lower if she misses you from across the "
         "room. 0 = off.",
         min=0.0, max=0.01, restart=False,
+    ),
+    "noise_transcript_filter": EditableField(
+        "bool", "Ignore noise that sounds like words",
+        "Room noise whisper turns into words is treated as silence: it can't answer a yes/no, stop a task or "
+        "start one.", restart=False,
     ),
     "speaker_verification": EditableField(
         "bool", "Only listen to my voice",

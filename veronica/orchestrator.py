@@ -47,7 +47,7 @@ from veronica.brain.intents import (
 )
 from veronica.config import Settings
 from veronica.speech import voices
-from veronica.speech.stt import stt_spec
+from veronica.speech.stt import Transcript, expected_langs, noise_reason, stt_spec
 from veronica.brain.sentences import has_devanagari
 from veronica.tools import mac as mac_tools
 from veronica.tools import music as music_tools
@@ -65,8 +65,10 @@ log = logging.getLogger("veronica.orchestrator")
 PTT = object()
 
 # What confirm()'s listen returns for an answer in a voice that isn't the
-# enrolled one: never an answer, only a reason to listen once more.
+# enrolled one, or for noise whisper put words to: never an answer, only a
+# reason to listen once more.
 _NOT_THE_USER = object()
+_NOISE = object()
 
 # Trailing "stop dictation" (etc.) spoken in the same breath as the last
 # dictated sentence: stripped from what gets typed, and ends the dictation.
@@ -312,6 +314,31 @@ class Orchestrator:
             return "other"
         # No yes, no content: a no, or a mumble with nothing to redirect to.
         return "denied"
+
+    # Function words and hesitation noises, too small to steer by: with the
+    # answer words and fillers, what redirect_words leaves out.
+    _SMALL_WORDS = frozenset({
+        "a", "an", "the", "in", "of", "to", "is", "at", "with", "my", "your", "its", "be", "was", "i",
+        "mm", "mmm", "mhm", "huh", "umm", "uhh", "hmmm", "eh",
+        "mein", "ka", "ki", "ke", "se", "ko", "mujhe", "में", "का", "की", "के", "से", "को",
+    })
+    _REAL_WORD_RE = re.compile(r"[a-z]+|[\u0900-\u0963\u0970-\u097f]+")
+    _WORD_SPLIT_RE = re.compile(r"[\s,.!?;:\"()\-\u0964\u0965]+")
+
+    @staticmethod
+    def redirect_words(heard: str | None) -> int:
+        """How many distinct words of `heard` could carry an instruction:
+        English or Hindi words (a word with letters outside a-z and
+        Devanagari — "küsse" — isn't one) that aren't a yes, a no, filler or
+        a function word. Two or more and an "other" answer may redirect."""
+        flat = (heard or "").lower().replace("'", "").replace("’", "")
+        skip = (Orchestrator.ANSWER_FILLERS | Orchestrator.DENY_WORDS | Orchestrator._NEGATORS
+                | Orchestrator._SMALL_WORDS
+                | {w for phrase in Orchestrator.CONFIRM_WORDS for w in phrase.split()})
+        return len({
+            w for w in Orchestrator._WORD_SPLIT_RE.split(flat)
+            if w and w not in skip and Orchestrator._REAL_WORD_RE.fullmatch(w)
+        })
 
     # Phrases that, inside a request, mean "and don't ask me first"; with
     # STRONG_CONFIRMS ("copy this, just do it", "open chrome and go ahead",
@@ -1542,6 +1569,35 @@ class Orchestrator:
             return await self.stt.atranscribe(pcm), "en"
         return await detailed(pcm)
 
+    async def _transcribe_scored(self, pcm: np.ndarray) -> Transcript:
+        """The utterance with whisper's scores. Transcribers without the
+        scored API (older doubles) give an unscored Transcript, which
+        noise_reason always lets through."""
+        scored = getattr(self.stt, "atranscribe_scored", None)
+        if scored is not None:
+            return await scored(pcm)
+        text, detected = await self._transcribe(pcm)
+        return Transcript(text, detected)
+
+    def _expected_langs(self) -> tuple[str, ...]:
+        return expected_langs(self.language)
+
+    def _is_noise(self, r: Transcript, where: str) -> bool:
+        """True (and logged with the scores, so the thresholds can be tuned
+        from the log) when `r` is noise whisper put words to: the caller
+        treats it as silence."""
+        why = noise_reason(r, self.s, self._expected_langs())
+        if not why:
+            return False
+
+        def f(v):
+            return "-" if v is None else f"{v:.2f}"
+
+        log.info("stt: treated as noise (%s; no_speech=%s logprob=%s compression=%s lang=%s/%s) [%s]: %r",
+                 why, f(r.no_speech_prob), f(r.avg_logprob), f(r.compression_ratio),
+                 r.language, f(r.language_probability), where, r.text)
+        return True
+
     def _lang_for(self, text: str, detected: str) -> str:
         """The language an utterance is answered in: Devanagari script or a
         "hi" detection means Hindi; in the Hindi/auto modes a known Hinglish
@@ -2041,7 +2097,10 @@ class Orchestrator:
             if not await self._speaker_ok(pcm, "dictation"):
                 self._ignored_voice("dictation")
                 continue   # someone else talking: not typed, keep listening
-            text = await self.stt.atranscribe(pcm)
+            heard_r = await self._transcribe_scored(pcm)
+            text = heard_r.text
+            if text and self._is_noise(heard_r, "dictation"):
+                continue   # not typed, keep listening
             self._emit("heard", text)
             if not text:
                 break
@@ -2126,41 +2185,42 @@ class Orchestrator:
                     "summary": summary, "detail": detail, "decision": "ask",
                     "timeout_ms": self.s.confirm_listen_s * 1000,
                 })
-                # From here until the capture returns, whatever the user says
-                # belongs to this question: _run_with_barge stops treating
-                # speech (or a PTT press) as a barge and lets it land in the
-                # capture below, so classify_answer — still the only thing
-                # that decides — sees it. Cleared in finally so an error
-                # here can't leave barge-in disabled for the rest of the turn.
-                self._confirm_listening = True
-                try:
-                    heard = await self._confirm_listen()
-                    if heard is _NOT_THE_USER or (heard and self._is_own_speech(heard)):
-                        # The question itself leaking back in through the mic.
-                        # Read as an answer it was "other": the step declined
-                        # and her own words run as the next request. It's no
-                        # answer at all, so listen once more. The same goes for
-                        # someone else's voice (the TV, a person in the room):
-                        # it is never a yes, never a redirect.
-                        log.info("confirm heard %s; listening again",
-                                 "another voice" if heard is _NOT_THE_USER else f"its own question ({heard!r})")
-                        heard = await self._confirm_listen()
-                        if heard is _NOT_THE_USER or (heard and self._is_own_speech(heard)):
-                            heard = None
-                finally:
-                    self._confirm_listening = False
-                if self._barged:
-                    # barged while we were listening for / transcribing the
-                    # reply (a barge unblocks the capture, so pcm is None).
-                    log.info("confirm aborted by barge")
-                    return result
+                heard, outcome = "", "denied"
+                for attempt in range(2):
+                    if attempt:
+                        # An "other" that doesn't read like an instruction
+                        # ("Safari.", a word of another language): running it
+                        # would end the task on a mishearing, so ask once more.
+                        await self._say_unlocked(self.UNCLEAR_PROMPT, kind="prompt")
+                        if self._barged:
+                            log.info("confirm aborted by barge")
+                            return result
+                        self._emit("tool", {
+                            "summary": summary, "detail": detail, "decision": "ask",
+                            "timeout_ms": self.s.confirm_listen_s * 1000,
+                        })
+                    r = await self._confirm_answer()
+                    if self._barged:
+                        # barged while we were listening for / transcribing the
+                        # reply (a barge unblocks the capture, so pcm is None).
+                        log.info("confirm aborted by barge")
+                        return result
+                    heard = (r.text if r is not None else "") or ""
+                    if not heard:
+                        break
+                    outcome = self.classify_answer(heard)
+                    if outcome != "other" or self._plausible_redirect(r):
+                        break
+                    log.info("confirm heard=%r -> unclear (not an instruction)%s",
+                             heard, "" if attempt else "; asking again")
+                    heard, outcome = "", "denied"
                 if not heard:
-                    # Silence: say so, so the user knows the window closed
-                    # (an explicit "no" gets no such line).
+                    # Silence (or noise, or still unclear): say so, so the
+                    # user knows the window closed (an explicit "no" gets no
+                    # such line).
                     log.info("confirm heard nothing -> denied")
                     await self._say_unlocked("Okay, skipping that.")
                     return result
-                outcome = self.classify_answer(heard)
                 result = ConfirmResult(outcome, heard,
                                        always=outcome == "approved" and self.says_always(heard))
                 log.info("confirm heard=%r -> %s", heard, result.outcome)
@@ -2169,15 +2229,61 @@ class Orchestrator:
             self._emit("tool", {"summary": summary, "decision": self._DECISION_EVENT[result.outcome]})
         return result
 
+    UNCLEAR_PROMPT = "Sorry, yes or no?"
+
+    async def _confirm_answer(self) -> Transcript | None:
+        """One answer to the question just asked, or None for silence.
+
+        From here until the capture returns, whatever the user says belongs
+        to this question: _run_with_barge stops treating speech (or a PTT
+        press) as a barge and lets it land in the capture below, so
+        classify_answer — still the only thing that decides — sees it.
+        Cleared in finally so an error here can't leave barge-in disabled
+        for the rest of the turn."""
+        self._confirm_listening = True
+        try:
+            r = await self._confirm_listen()
+            if self._not_an_answer(r):
+                # The question itself leaking back in through the mic. Read
+                # as an answer it was "other": the step declined and her own
+                # words run as the next request. It's no answer at all, so
+                # listen once more. The same goes for someone else's voice
+                # (the TV, a person in the room) and for noise whisper put
+                # words to: never a yes, never a redirect.
+                what = ("another voice" if r is _NOT_THE_USER else "noise" if r is _NOISE
+                        else f"its own question ({r.text!r})")
+                log.info("confirm heard %s; listening again", what)
+                r = await self._confirm_listen()
+                if self._not_an_answer(r):
+                    r = None
+        finally:
+            self._confirm_listening = False
+        return r
+
+    def _not_an_answer(self, r) -> bool:
+        return r is _NOT_THE_USER or r is _NOISE or bool(r and r.text and self._is_own_speech(r.text))
+
+    def _plausible_redirect(self, r: Transcript) -> bool:
+        """Whether an "other" answer may stop the task and run as the next
+        request: two or more real words (redirect_words), in a language
+        the user speaks. With the noise filter off, any "other" is."""
+        if not self.s.noise_transcript_filter:
+            return True
+        return self.redirect_words(r.text) >= 2 and r.language in self._expected_langs()
+
     async def _confirm_listen(self):
-        """The answer's text, None for silence, or _NOT_THE_USER for a voice
-        the speaker check rejected (never transcribed, so never classified)."""
+        """The answer's Transcript, None for silence, _NOT_THE_USER for a
+        voice the speaker check rejected (never transcribed, so never
+        classified), or _NOISE for noise whisper put words to."""
         pcm = await self._capture(max_s=max(1, self.s.confirm_listen_s))
         if pcm is None or self._barged:
             return None
         if not await self._speaker_ok(pcm, "confirm"):
             return _NOT_THE_USER
-        return await self.stt.atranscribe(pcm)
+        r = await self._transcribe_scored(pcm)
+        if r.text and self._is_noise(r, "confirm"):
+            return _NOISE
+        return r
 
     # `allowed` stays the wire value for an approved confirm (the HUD and
     # older tests know it); "other" shows as a redirect.
@@ -2354,7 +2460,8 @@ class Orchestrator:
         is_followup = False
         while True:
             other_voice = not await self._speaker_ok(pcm, "follow-up" if is_followup else "request")
-            text, detected = await self._transcribe(pcm)
+            heard_r = await self._transcribe_scored(pcm)
+            text, detected = heard_r.text, heard_r.language
             if other_voice and match_speaker_intent(text) != "forget":
                 # Someone else's voice: as if nothing was said, so the turn
                 # ends here (no "didn't catch that", no brain turn); a card
@@ -2362,6 +2469,11 @@ class Orchestrator:
                 # profile that stopped matching the user can't lock them out.
                 self._ignored_voice("follow-up" if is_followup else "request")
                 break
+            if text and self._is_noise(heard_r, "follow-up" if is_followup else "request"):
+                # Noise whisper put words to: as if nothing was said — the
+                # "didn't catch that" (or, on a follow-up, the quiet end)
+                # an empty transcript gets, and no brain turn.
+                text = ""
             self._utterance_lang = self._lang_for(text, detected)
             if is_followup and text and self._is_own_speech(text):
                 log.info("ignoring own speech echo on follow-up: %r", text)
